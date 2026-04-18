@@ -14,11 +14,6 @@ class TestScraper:
         self.profile_dir = profile_dir
         self.token = token
 
-        if not self.profile_dir:
-            raise ValueError("ОШИБКА: CHROME_PROFILE_DIR не задан в .env файле!")
-        if not self.token:
-            raise ValueError("ОШИБКА: VK_TEST_TOKEN не задан в .env файле!")
-
         options = uc.ChromeOptions()
         options.add_argument("--start-maximized")
         options.page_load_strategy = 'eager'
