@@ -1,31 +1,38 @@
+import os
 import requests
 import json
+import re
 from bs4 import BeautifulSoup
 import undetected_chromedriver as uc
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 class TestScraper:
-    def __init__(self):
-        # Инициализируем Selenium (можно добавить опции для скрытия браузера, но пока нам нужен UI для авторизации)
+    def __init__(self, profile_dir, token):
+        self.profile_dir = profile_dir
+        self.token = token
+
+        if not self.profile_dir:
+            raise ValueError("ОШИБКА: CHROME_PROFILE_DIR не задан в .env файле!")
+        if not self.token:
+            raise ValueError("ОШИБКА: VK_TEST_TOKEN не задан в .env файле!")
+
         options = uc.ChromeOptions()
         options.add_argument("--start-maximized")
-
-        # Меняем стратегию загрузки: 'eager' означает, что скрипт продолжит работу,
-        # как только загрузится структура DOM (не дожидаясь всех картинок и рекламы)
         options.page_load_strategy = 'eager'
-        # профиль гугла ~/Application Support/... надо скопировать текущий
-        #options.add_argument(r"--user-data-dir=/Users/name/all/python_proj/for_test/avito_pars/bot_profile")
-        options.add_argument(r"--profile-directory=Default")  # или "Profile 1"
 
-        driver = uc.Chrome(options=options, version_main=137)
+        # Используем путь из .env
+        options.add_argument(f"--user-data-dir={self.profile_dir}")
+        options.add_argument(r"--profile-directory=Default")
 
-        # Устанавливаем максимальное время ожидания загрузки страницы — 30 секунд
-        driver.set_page_load_timeout(30)
-        self.driver = driver
+        self.driver = uc.Chrome(options=options, version_main=137)
+        self.driver.set_page_load_timeout(30)
+
         self.session = requests.Session()
 
     def clean_html(self, raw_html):
-        """Очищает текст от HTML тегов (span, strong, br и т.д.)"""
         if not raw_html:
             return ""
         soup = BeautifulSoup(raw_html, "html.parser")
@@ -37,7 +44,6 @@ class TestScraper:
 
         for cookie in selenium_cookies:
             self.session.cookies.set(cookie['name'], cookie['value'], domain=cookie['domain'])
-            # Ищем CSRF токен для POST запросов
             if cookie['name'] == 'csrftoken':
                 csrf_token = cookie['value']
 
@@ -49,39 +55,102 @@ class TestScraper:
             'Referer': self.driver.current_url
         }
 
-        # Если нашли CSRF токен, обязательно добавляем его в заголовки
         if csrf_token:
             headers['X-CSRFToken'] = csrf_token
 
         self.session.headers.update(headers)
 
-    def run(self, test_url, test_id):
-        print(f"Открываю браузер. Авторизуйся и открой страницу с кнопкой 'Начать тест'.")
-        self.driver.get(test_url)
+    def fetch_and_show_menu(self):
+        print("\nЗапрашиваю список доступных тестов...")
+        tests_url = "https://techno-test.vk.company/api/tests/"
+        response = self.session.get(tests_url)
 
-        input("Нажми Enter в консоли, когда страница загрузится (нажимать 'Начать' в браузере НЕ НУЖНО)...")
+        if response.status_code != 200:
+            print(f"Ошибка получения списка тестов: HTTP {response.status_code}")
+            return None
+
+        tests_data = response.json()
+
+        def extract_number(name):
+            match = re.search(r'^(\d+)', name)
+            return int(match.group(1)) if match else 9999
+
+        tests_data.sort(key=lambda x: extract_number(x.get('name', '')))
+
+        print("\n" + "=" * 80)
+        print(f"{'ID':<6} | {'Статус':<12} | {'Прогресс':<9} | {'Название'}")
+        print("-" * 80)
+
+        for t in tests_data:
+            t_id = t.get('id')
+            t_name = t.get('name')
+            attempt = t.get('attempt')
+
+            if attempt is None:
+                status_str = "Не начат"
+                progress = "0/0"
+            else:
+                status_code = attempt.get('status')
+                ans_count = attempt.get('answers_count', 0)
+                q_count = attempt.get('questions_count', 0)
+                progress = f"{ans_count}/{q_count}"
+
+                if status_code == 1:
+                    status_str = "[ЗАВЕРШЕН]"
+                else:
+                    status_str = "В процессе"
+
+            short_name = t_name[:50] + "..." if len(t_name) > 50 else t_name
+            print(f"{t_id:<6} | {status_str:<12} | {progress:<9} | {short_name}")
+
+        print("=" * 80)
+
+        while True:
+            choice = input("\nВведи ID теста, который хочешь спарсить (или 'q' для выхода): ")
+            if choice.lower() == 'q':
+                return None
+            if choice.isdigit():
+                chosen_id = int(choice)
+                if any(t.get('id') == chosen_id for t in tests_data):
+                    return str(chosen_id)
+                else:
+                    print("Такого ID нет в таблице выше. Попробуй еще раз.")
+            else:
+                print("Пожалуйста, введи только цифры ID.")
+
+    def run(self):
+        # Формируем URL используя токен из .env
+        base_url = f"https://techno-test.vk.company/ru/test/?token={self.token}"
+
+        print(f"Открываю браузер...")
+        self.driver.get(base_url)
+
+        input("Нажми Enter в консоли, когда страница прогрузится и ты будешь авторизован...")
         self.get_cookies_from_selenium()
 
-        # --- ШАГ 1: Пытаемся получить текущее состояние теста ---
+        test_id = self.fetch_and_show_menu()
+        if not test_id:
+            print("Выход. Закрываю браузер.")
+            self.driver.quit()
+            return
+
+        print(f"\nНачинаю работу с тестом ID: {test_id}...")
+
         api_url = f"https://techno-test.vk.company/api/test/{test_id}/"
         response = self.session.get(api_url)
 
-        # --- ШАГ 2: Если попытки нет (404), стартуем новую ---
         if response.status_code == 404:
             print("Актуальная попытка не найдена. Инициирую старт теста...")
             start_url = f"https://techno-test.vk.company/api/start_attempt/{test_id}/"
-
             start_response = self.session.post(start_url)
 
             if start_response.status_code not in (200, 201, 204):
                 print(f"Критическая ошибка при старте теста: HTTP {start_response.status_code}")
                 print(f"Ответ сервера: {start_response.text}")
-                # Если здесь 403 - значит проблема с CSRF
                 self.driver.quit()
                 return
 
             print("Тест успешно начат. Запрашиваю данные...")
-            # Повторяем GET запрос, теперь он должен вернуть 200
             response = self.session.get(api_url)
 
         if response.status_code != 200:
@@ -93,18 +162,15 @@ class TestScraper:
         part_answers = data.get("participant_answers", [])
         current_question = data.get("question")
 
-        # Находим индекс текущего вопроса (чтобы не начинать с 0, если тест был прерван)
-        # Ищем первый id в participant_answers, у которого value равно null
         question_index = 0
         for i, pa in enumerate(part_answers):
             if pa.get("value") is None:
                 question_index = i
                 break
 
-        # --- ШАГ 3: Основной цикл ---
         while current_question:
             if question_index >= len(part_answers):
-                print("Похоже, это был последний вопрос. Тест завершен.")
+                print("Похоже, это был последний вопрос (или тест уже завершен). Скрапинг остановлен.")
                 break
 
             participant_answer_id = part_answers[question_index]["id"]
@@ -145,13 +211,24 @@ class TestScraper:
                 print(post_response.text)
                 break
 
-        print("\nСкрапинг завершен. Закрываю браузер.")
+        print("\nРабота скрипта завершена. Закрываю браузер.")
         self.driver.quit()
 
-if __name__ == "__main__":
-    scraper = TestScraper()
-    TEST_ID = "3034" # 3030 - первый тест. дальше инкремент
-    #TARGET_URL = f"https://techno-test.vk.company/ru/test/?token=TOKEN&test_id={TEST_ID}"
-    TARGET_URL = f"https://techno-test.vk.company/ru/test/?test_id={TEST_ID}"
 
-    scraper.run(TARGET_URL, TEST_ID)
+if __name__ == "__main__":
+    PROFILE_DIR = os.getenv("CHROME_PROFILE_DIR")
+    TOKEN = os.getenv("VK_TEST_TOKEN")
+
+    if not PROFILE_DIR:
+        raise ValueError("ОШИБКА: CHROME_PROFILE_DIR не задан в .env файле!")
+    if not TOKEN:
+        raise ValueError("ОШИБКА: VK_TEST_TOKEN не задан в .env файле!")
+
+    try:
+        scraper = TestScraper(
+            profile_dir=PROFILE_DIR,
+            token=TOKEN,
+        )
+        scraper.run()
+    except Exception as e:
+        print(f"\nКритическая ошибка: {e}")
